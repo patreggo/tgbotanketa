@@ -80,6 +80,18 @@ def moderation_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📊 Статусы", callback_data="admin:status"),
+                InlineKeyboardButton(text="📋 Анкеты", callback_data="admin:applications"),
+            ],
+            [InlineKeyboardButton(text="📥 Выгрузить CSV", callback_data="admin:export")],
+        ]
+    )
+
+
 def applicant_card(applicant: Applicant) -> str:
     username = f"@{escape(applicant.username)}" if applicant.username else "не указан"
     profile_name = " ".join(
@@ -111,9 +123,46 @@ def build_router(settings: Settings, database: Database) -> Router:
             except TelegramForbiddenError:
                 logger.warning("Администратор %s ещё не открыл диалог с ботом", admin_id)
 
+    def status_text() -> str:
+        counts = database.counts()
+        order = (Status.filling, Status.registered, Status.join_requested, Status.approved, Status.joined, Status.rejected, Status.left)
+        lines = [f"{STATUS_LABELS[item]}: <b>{counts.get(item.value, 0)}</b>" for item in order]
+        return "<b>Статусы анкет</b>\n" + "\n".join(lines)
+
+    def applications_text() -> str:
+        applicants = database.all_applicants()
+        if not applicants:
+            return "Анкет пока нет."
+        lines = ["<b>Последние анкеты</b>"]
+        for applicant in applicants[:50]:
+            lines.append(f"• {applicant.full_name} — {STATUS_LABELS[Status(applicant.status)]} (<code>{applicant.telegram_id}</code>)")
+        if len(applicants) > 50:
+            lines.append(f"\nПоказаны 50 из {len(applicants)}. Полный список: /export")
+        return "\n".join(lines)
+
+    def export_document() -> BufferedInputFile:
+        stream = io.StringIO(newline="")
+        writer = csv.writer(stream, delimiter=";")
+        writer.writerow(["Фамилия", "Имя", "Telegram ID", "Username", "Статус", "Анкета", "Заявка", "Одобрено", "Вступил", "Вышел"])
+        for applicant in database.all_applicants():
+            writer.writerow([
+                applicant.last_name or "", applicant.first_name or "", applicant.telegram_id,
+                applicant.username or "", STATUS_LABELS[Status(applicant.status)], applicant.submitted_at or "",
+                applicant.join_requested_at or "", applicant.approved_at or "", applicant.joined_at or "", applicant.left_at or "",
+            ])
+        return BufferedInputFile(stream.getvalue().encode("utf-8-sig"), filename="applicants.csv")
+
+    async def show_admin_panel(message: Message, state: FSMContext | None = None) -> None:
+        if state:
+            await state.clear()
+        await message.answer("<b>Панель администратора</b>\nУправляйте заявками кнопками ниже.", reply_markup=admin_panel_keyboard())
+
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext) -> None:
         assert message.from_user
+        if message.from_user.id in settings.admin_ids:
+            await show_admin_panel(message, state)
+            return
         existing = database.get(message.from_user.id)
         if existing and existing.status in {Status.join_requested, Status.approved, Status.joined}:
             await message.answer(f"Ваша анкета уже есть в системе. Статус: <b>{STATUS_LABELS[Status(existing.status)]}</b>.")
@@ -188,6 +237,30 @@ def build_router(settings: Settings, database: Database) -> Router:
             return
         await notify_admins(request.bot, applicant_card(applicant), moderation_keyboard(applicant.telegram_id))
 
+    @router.message(Command("admin"))
+    async def admin_panel(message: Message, state: FSMContext) -> None:
+        if not message.from_user or message.from_user.id not in settings.admin_ids:
+            return
+        await show_admin_panel(message, state)
+
+    @router.callback_query(F.data.startswith("admin:"))
+    async def admin_panel_action(callback: CallbackQuery) -> None:
+        assert callback.from_user and callback.data and callback.message
+        if callback.from_user.id not in settings.admin_ids:
+            await callback.answer("У вас нет прав администратора.", show_alert=True)
+            return
+        action = callback.data.removeprefix("admin:")
+        if action == "status":
+            await callback.message.answer(status_text())
+        elif action == "applications":
+            await callback.message.answer(applications_text())
+        elif action == "export":
+            await callback.message.answer_document(export_document(), caption="Реестр заявок")
+        else:
+            await callback.answer("Неизвестное действие.", show_alert=True)
+            return
+        await callback.answer()
+
     @router.callback_query(F.data.startswith("moderate:"))
     async def moderate(callback: CallbackQuery) -> None:
         assert callback.from_user and callback.data and callback.message
@@ -236,41 +309,19 @@ def build_router(settings: Settings, database: Database) -> Router:
     async def status(message: Message) -> None:
         if not message.from_user or message.from_user.id not in settings.admin_ids:
             return
-        counts = database.counts()
-        order = (Status.filling, Status.registered, Status.join_requested, Status.approved, Status.joined, Status.rejected, Status.left)
-        lines = [f"{STATUS_LABELS[item]}: <b>{counts.get(item.value, 0)}</b>" for item in order]
-        await message.answer("<b>Статусы анкет</b>\n" + "\n".join(lines))
+        await message.answer(status_text())
 
     @router.message(Command("applications"))
     async def applications(message: Message) -> None:
         if not message.from_user or message.from_user.id not in settings.admin_ids:
             return
-        applicants = database.all_applicants()
-        if not applicants:
-            await message.answer("Анкет пока нет.")
-            return
-        lines = ["<b>Последние анкеты</b>"]
-        for applicant in applicants[:50]:
-            lines.append(f"• {applicant.full_name} — {STATUS_LABELS[Status(applicant.status)]} (<code>{applicant.telegram_id}</code>)")
-        if len(applicants) > 50:
-            lines.append(f"\nПоказаны 50 из {len(applicants)}. Полный список: /export")
-        await message.answer("\n".join(lines))
+        await message.answer(applications_text())
 
     @router.message(Command("export"))
     async def export(message: Message) -> None:
         if not message.from_user or message.from_user.id not in settings.admin_ids:
             return
-        stream = io.StringIO(newline="")
-        writer = csv.writer(stream, delimiter=";")
-        writer.writerow(["Фамилия", "Имя", "Telegram ID", "Username", "Статус", "Анкета", "Заявка", "Одобрено", "Вступил", "Вышел"])
-        for applicant in database.all_applicants():
-            writer.writerow([
-                applicant.last_name or "", applicant.first_name or "", applicant.telegram_id,
-                applicant.username or "", STATUS_LABELS[Status(applicant.status)], applicant.submitted_at or "",
-                applicant.join_requested_at or "", applicant.approved_at or "", applicant.joined_at or "", applicant.left_at or "",
-            ])
-        document = BufferedInputFile(stream.getvalue().encode("utf-8-sig"), filename="applicants.csv")
-        await message.answer_document(document, caption="Реестр заявок")
+        await message.answer_document(export_document(), caption="Реестр заявок")
 
     return router
 
