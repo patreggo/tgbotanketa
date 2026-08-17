@@ -157,6 +157,13 @@ def build_router(settings: Settings, database: Database) -> Router:
             await state.clear()
         await message.answer("<b>Панель администратора</b>\nУправляйте заявками кнопками ниже.", reply_markup=admin_panel_keyboard())
 
+    async def update_admin_panel(message: Message, text: str) -> None:
+        try:
+            await message.edit_text(text, reply_markup=admin_panel_keyboard())
+        except TelegramBadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                raise
+
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext) -> None:
         assert message.from_user
@@ -251,11 +258,12 @@ def build_router(settings: Settings, database: Database) -> Router:
             return
         action = callback.data.removeprefix("admin:")
         if action == "status":
-            await callback.message.answer(status_text())
+            await update_admin_panel(callback.message, status_text())
         elif action == "applications":
-            await callback.message.answer(applications_text())
+            await update_admin_panel(callback.message, applications_text())
         elif action == "export":
             await callback.message.answer_document(export_document(), caption="Реестр заявок")
+            await update_admin_panel(callback.message, "<b>Панель администратора</b>\nФайл с реестром отправлен.")
         else:
             await callback.answer("Неизвестное действие.", show_alert=True)
             return
